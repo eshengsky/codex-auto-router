@@ -1,0 +1,11 @@
+node_modules/
+ui/dist-v4/
+dist/
+reports/
+coverage/
+.DS_Store
+.env
+.env.*
+*.log
+probe-result.json
+test-result.txt

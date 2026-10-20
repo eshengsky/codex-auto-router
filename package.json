@@ -1,0 +1,42 @@
+{
+  "name": "codex-auto-router",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "probe": "node scripts/probe.mjs",
+    "build": "vite build",
+    "dev": "vite --host 127.0.0.1",
+    "settings": "node scripts/open-settings.mjs",
+    "test:install": "node --test test/installer.test.mjs test/install-output.test.mjs test/release.test.mjs",
+    "notices": "node scripts/third-party-notices.mjs",
+    "release:prepare": "npm run build && npm run notices && node scripts/package-release.mjs",
+    "release:verify": "node scripts/verify-release.mjs"
+  },
+  "dependencies": {
+    "@openai/apps-sdk-ui": "0.2.2",
+    "@tailwindcss/vite": "4.3.3",
+    "@vitejs/plugin-react": "5.2.0",
+    "react": "19.3.1",
+    "react-dom": "19.3.1",
+    "tailwindcss": "4.3.3",
+    "vite": "7.3.7"
+  },
+  "overrides": {
+    "lodash": "4.18.1"
+  },
+  "version": "0.1.0",
+  "description": "Automatically selects the right model and reasoning effort for each task in Codex, with customizable routing and a local settings page.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/eshengsky/codex-auto-router.git"
+  },
+  "homepage": "https://github.com/eshengsky/codex-auto-router#readme",
+  "bugs": {
+    "url": "https://github.com/eshengsky/codex-auto-router/issues"
+  },
+  "engines": {
+    "node": ">=22.12.0"
+  }
+}

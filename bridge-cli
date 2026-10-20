@@ -1,0 +1,11 @@
+#!/bin/sh
+root=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
+node_bin=/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node
+# This check consumes no desktop input. Once the bridge starts, exec replaces
+# this shell; a later native failure can never cause an automatic request replay.
+if [ -x "$node_bin" ] && [ -r "$root/src/entry.mjs" ] && "$node_bin" "$root/src/entry.mjs" --smart-selection-check </dev/null; then
+  exec "$node_bin" "$root/src/entry.mjs" "$@"
+fi
+printf '%s\n' 'Smart selection unavailable; using native Codex.' >&2
+exec /usr/bin/env -u CODEX_CLI_PATH -u CODEX_APP_SERVER_USE_LOCAL_DAEMON \
+  /Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex "$@"
