@@ -8,8 +8,6 @@
 
 这是一个非官方开源工具，目前支持 macOS。
 
-## 演示视频
-
 https://github.com/user-attachments/assets/6a2b9238-c379-4551-a44b-59604ed348b8
 
 ## 安装与开始使用
