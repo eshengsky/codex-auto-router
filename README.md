@@ -8,6 +8,10 @@ Choose **Auto** in the model menu to use automatic routing. Select a specific mo
 
 An unofficial open-source tool for macOS.
 
+## Demo
+
+https://github.com/user-attachments/assets/41c80d1e-ca45-411e-9e74-9e7bf9b30697
+
 ## Install and start using Auto
 
 Open **Terminal** and run:
