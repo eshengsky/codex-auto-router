@@ -9,13 +9,16 @@ import { createServer } from 'node:http';
 import { createInterface } from 'node:readline';
 import { createHash } from 'node:crypto';
 import { AUTO } from '../src/bridge.mjs';
+import { RouteStore } from '../src/state.mjs';
 const FIXTURE_ROUTE = { model: 'gpt-6-luna', effort: 'medium' };
 
 const root = fileURLToPath(new URL('../', import.meta.url));
 const binary = '/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex';
 const home = mkdtempSync(join(tmpdir(), 'smart-native-'));
 const fixtureRoot = join(home, 'bridge-fixture');
-const env = { HOME: home, CODEX_HOME: home, PATH: '/usr/bin:/bin:/usr/sbin:/sbin', TMPDIR: home, LANG: 'en_US.UTF-8' };
+// Custom providers use HTTP as well as WebSockets. Keep loopback requests out
+// of system proxies so the outbound-network sandbox remains deterministic.
+const env = { HOME: home, CODEX_HOME: home, PATH: '/usr/bin:/bin:/usr/sbin:/sbin', TMPDIR: home, LANG: 'en_US.UTF-8', NO_PROXY: '127.0.0.1,localhost' };
 const calls = [], checks = [], sessions = [];
 let serial = 0, stderr = '', httpError;
 const server = createServer(async (req, res) => {
@@ -248,13 +251,82 @@ try {
   assert.equal(bare.reasoningEffort, 'high');
   assert.equal(readFileSync(join(home, 'config.toml'), 'utf8'), config);
   checks.push('switching back to Auto preserves Astra High; unmodified native engine reopens chat; config unchanged');
+  await s.close();
+  // Change only the isolated fixture home. A harmless resume override makes
+  // native Codex apply the new provider, reproducing the original mismatch.
+  writeFileSync(join(home, 'config.toml'), `model_provider = "fixture-provider"\n${config}\n[model_providers.fixture-provider]\nname = "Local regression fixture"\nbase_url = "http://127.0.0.1:${server.address().port}/v1"\nwire_api = "responses"\nrequires_openai_auth = false\n`);
+  s = connect(); await s.initialize();
+  const beforeResume = calls.length;
+  const switched = await s.send('thread/resume', { threadId: id, config: { model_reasoning_effort: 'medium' } });
+  assert.equal(switched.modelProvider, 'fixture-provider');
+  assert.notEqual(switched.model, AUTO);
+  const providerModels = await s.send('model/list');
+  assert.ok(providerModels.data.length);
+  assert.equal(providerModels.data.some(m => m.model === AUTO), false);
+  assert.equal(calls.length, beforeResume);
+  checks.push('provider switch reopens old Auto chat with native settings and selectable native models, without inference');
+  await s.close();
+  // Old versions left no operation type in pending records. Recover the picker
+  // without assuming whether an earlier turn reached the native process.
+  new RouteStore(join(home, 'smart-selection-prototype', 'threads')).write(id,
+    { mode: 'auto', phase: 'pending', model: 'gpt-6-astra', effort: 'high' });
+  s = connect(); await s.initialize();
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const recovered = await s.send('thread/resume', { threadId: id });
+    assert.equal(recovered.modelProvider, 'fixture-provider');
+    assert.notEqual(recovered.model, AUTO);
+  }
+  await assert.rejects(s.send('turn/start', { threadId: id, input: [{ type: 'text', text: 'MUST_NOT_SEND' }] }), /interrupted/);
+  assert.equal(calls.length, beforeResume);
+  checks.push('legacy pending chat opens repeatedly without replaying a turn');
+  await s.send('thread/settings/update', { threadId: id, model: 'gpt-6-luna', effort: 'low' });
+  assert.equal((await s.send('thread/read', { threadId: id, includeTurns: false })).thread.modelProvider, 'fixture-provider');
+  const providerTurn = await s.send('turn/start', { threadId: id, input: [{ type: 'text', text: 'SYNTHETIC_PROVIDER_MANUAL' }] });
+  await s.completed(providerTurn.turn.id);
+  const providerRequests = calls.slice(beforeResume);
+  assert.equal(providerRequests.length, 1);
+  assert.equal(providerRequests[0].model, 'gpt-6-luna');
+  assert.equal(providerRequests[0].reasoning.effort, 'low');
+  checks.push('legacy pending recovery survives restart; no replay; explicit native model choice permits one manual turn on the new provider');
+  await s.close();
+  // Removing the provider definition is distinct from switching providers while
+  // keeping it registered. Native resume cannot open the saved session unaided.
+  writeFileSync(join(home, 'config.toml'), config);
+  s = connect(true); await s.initialize();
+  await assert.rejects(s.send('thread/resume', { threadId: id }), /Model provider `fixture-provider` not found/);
+  await s.close();
+  new RouteStore(join(home, 'smart-selection-prototype', 'threads')).write(id,
+    { mode: 'auto', phase: 'pending', model: 'gpt-6-astra', effort: 'high' });
+  s = connect(); await s.initialize();
+  const beforeRemovedProvider = calls.length;
+  const restored = await s.send('thread/resume', { threadId: id });
+  assert.equal(restored.modelProvider, 'openai');
+  assert.equal(restored.model, FIXTURE_ROUTE.model);
+  assert.ok((await s.send('model/list')).data.length);
+  await assert.rejects(s.send('turn/start', { threadId: id, model: AUTO, input: [] }), /interrupted/);
+  assert.equal(calls.length, beforeRemovedProvider);
+  await s.close();
+  s = connect(); await s.initialize();
+  assert.equal((await s.send('thread/resume', { threadId: id })).modelProvider, 'openai');
+  await s.send('thread/settings/update', { threadId: id, model: 'gpt-6-luna', effort: 'low' });
+  const restoredTurn = await s.send('turn/start', { threadId: id, input: [{ type: 'text', text: 'SYNTHETIC_REMOVED_PROVIDER' }] });
+  await s.completed(restoredTurn.turn.id);
+  const restoredRequests = calls.slice(beforeRemovedProvider);
+  // Native WebSocket clients may warm up the new provider connection before
+  // generating. Count the user task and native turn, not transport warmups.
+  assert.equal(restoredRequests.filter(c => JSON.stringify(c.input).includes('SYNTHETIC_REMOVED_PROVIDER')).length, 1);
+  assert.equal(restoredRequests.some(c => JSON.stringify(c).includes('Classify the supplied task')), false);
+  assert.equal(s.notices.filter(n => n.method === 'turn/started' && n.params.threadId === id).length, 1);
+  assert.equal(readFileSync(join(home, 'config.toml'), 'utf8'), config);
+  checks.push('removed provider reproduces native config error; bridge restores current provider without editing config or inference; restart, model selection and manual send succeed');
   if (httpError) throw httpError;
   const report = { status: 'passed', autoEffortsObserved: [firstEffort, nextEffort], checks, simulatedRequests: calls.length, realInference: false, desktopUI: 'pending user verification' };
   writeFileSync(join(root, 'probe-result.json'), JSON.stringify(report, null, 2) + '\n');
   console.log(JSON.stringify(report, null, 2));
 } catch (error) {
   let decisions=[]; try{decisions=JSON.parse(readFileSync(join(home,'smart-selection-prototype','decisions.json'),'utf8'));}catch{}
-  const report = { status: 'failed', checks, httpRequests: calls.length, decisions, error: error.message, nativeStderr: stderr.slice(-6000) };
+  const report = { status: 'failed', checks, httpRequests: calls.length, fixtureError: httpError?.message, decisions, error: error.message,
+    recentRequests: calls.slice(-3).map(c => ({ type: c.type, model: c.model, generate: c.generate, inputItems: c.input?.length })), nativeStderr: stderr.slice(-6000) };
   writeFileSync(join(root, 'probe-result.json'), JSON.stringify(report, null, 2) + '\n');
   console.error(JSON.stringify(report, null, 2)); process.exitCode = 1;
 } finally {

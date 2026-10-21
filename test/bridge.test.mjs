@@ -15,6 +15,7 @@ function fixture(t, { select = async () => ({ ...FIXTURE_ROUTE }), models } = {}
   let next = 0, reject = false;
   const request = async (method, p) => {
     calls.push({ method, params: structuredClone(p) });
+    if (method === 'config/read') return { config: {} };
     if (method === 'model/list') return { data: models ?? [{ id: FIXTURE_ROUTE.model, model: FIXTURE_ROUTE.model, displayName: 'GPT-6 Luna', defaultReasoningEffort: 'medium', isDefault: true,
       supportedReasoningEfforts: [{ reasoningEffort: 'low' }, { reasoningEffort: 'medium' }] }], nextCursor: null };
     if (method === 'thread/turns/list') return { data: [] };
@@ -67,8 +68,8 @@ test('selecting Auto preserves native model and effort on existing chats, resume
     // Native settings are authoritative even if an older bridge saved another route.
     f.store.write('existing', { mode: 'auto', phase: 'confirmed', model: 'gpt-6.1-sol', effort: 'low' });
     await f.bridge.handle(method, { threadId: 'existing', model: AUTO, effort: 'medium' });
-    assert.equal(f.calls.at(-1).params.model, 'gpt-6-astra');
-    assert.equal(f.calls.at(-1).params.effort ?? f.calls.at(-1).params.config.model_reasoning_effort, 'high');
+    assert.equal(f.native.model, 'gpt-6-astra');
+    assert.equal(f.native.effort, 'high');
   }
 });
 
@@ -271,7 +272,8 @@ test('Auto classifies once per send, applies the route to Plan, and preserves it
   assert.equal(count, 3);
   const reopened = new SmartBridge({ request: f.request, store: f.store, select: () => { throw new Error('resume must not classify'); } });
   await reopened.handle('thread/resume', { threadId: 't1' });
-  assert.equal(f.calls.at(-1).params.config.model_reasoning_effort, 'low');
+  assert.equal(f.native.model, 'gpt-6-luna');
+  assert.equal(f.native.effort, 'low');
   await f.bridge.handle('thread/settings/update', { threadId: 't1', model: 'gpt-6-luna', effort: 'high' });
   await f.bridge.handle('turn/start', { threadId: 't1', input: [] });
   assert.equal(count, 3);

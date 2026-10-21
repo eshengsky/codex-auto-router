@@ -11,6 +11,14 @@
 
 The public plugin system does not provide this model-menu integration. `CODEX_CLI_PATH`, app-server request handling and the bundled executable layout are integration dependencies that can change. The project does not modify `app.asar`, application signatures or the user's global `config.toml`.
 
+### Provider changes and recovery
+
+Auto routing supports the native OpenAI provider. The bridge omits Auto from the model menu when the effective configuration selects a custom provider, while preserving the native model list. Existing chats can still be opened: resume delegates model/provider restoration to the native backend and uses its returned settings. A resumed OpenAI chat keeps its confirmed Auto preference; a chat returned on another provider switches to manual selection and displays its actual model. A global provider change alone does not force an existing native chat to migrate providers.
+
+Opening a chat never classifies or sends a task. Old pending selections do not block resume or the model picker, but remain unresolved until an explicit model choice succeeds. This prevents recovery from silently sending or replaying a possibly interrupted task. A failed resume does not create a new pending selection.
+
+If a tracked chat's saved provider definition has been removed, native resume may reject it before returning any settings. Only for that specific configuration rejection, and when the caller has not explicitly requested a provider, the bridge retries resume once using the current effective provider and model settings (including the active profile and project directory). The recovered chat requires a fresh model choice before sending. The bridge does not recreate the deleted provider or edit `config.toml`; an invalid current provider, unrelated error or lost response is not substituted or retried.
+
 ## Runtime and dependency packaging
 
 The release archive contains backend source modules, three installer support modules, the shell entries, package metadata, notices and the built settings page. No `node_modules`, Codex executable, Node executable, developer reports or local logs are distributed. The backend only requires Node built-ins. The frontend's dependencies are compiled into its static assets, with third-party notices included.

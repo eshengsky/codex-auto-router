@@ -60,6 +60,20 @@ export class SmartBridge {
     return { model, effort: effort ?? defaultEffort(this.models.find(m => m.model === model)) ?? null };
   }
   route(id) { return this.pending.get(id) ?? (id ? this.store.read(id) : null); }
+  isAuto(id, provider) {
+    const route = this.route(id);
+    return route?.mode === 'auto' && route.phase === 'confirmed' && (!provider || provider === 'openai');
+  }
+  async configuredProvider(params = {}) {
+    const explicit = params.modelProvider ?? params.config?.model_provider;
+    if (explicit != null) return explicit;
+    return (await this.effectiveConfig(params)).model_provider ?? 'openai';
+  }
+  async effectiveConfig(params = {}) {
+    const { config = {} } = await this.request('config/read', { includeLayers: false, ...(params.cwd ? { cwd: params.cwd } : {}) });
+    const profile = params.config?.profile ?? config.profile;
+    return { ...config, ...config.profiles?.[profile], ...params.config };
+  }
   publicSettings(value) {
     const out = { ...value, model: AUTO };
     // The virtual picker keeps one placeholder effort to skip the native slider.
@@ -70,14 +84,15 @@ export class SmartBridge {
     };
     return out;
   }
-  publicThread(thread) {
-    return thread?.id && this.route(thread.id)?.mode === 'auto' ? this.publicSettings(thread) : thread;
+  publicThread(thread, provider = thread?.modelProvider) {
+    return thread?.id && this.isAuto(thread.id, provider) ? this.publicSettings(thread) : thread;
   }
   publicResult(result, id) {
     if (!result || typeof result !== 'object') return result;
     const out = { ...result };
-    const auto = this.route(result.thread?.id ?? id)?.mode === 'auto';
-    if (result.thread) out.thread = this.publicThread(result.thread);
+    const provider = result.modelProvider ?? result.thread?.modelProvider;
+    const auto = this.isAuto(result.thread?.id ?? id, provider);
+    if (result.thread) out.thread = this.publicThread(result.thread, provider);
     if (auto && 'model' in out) Object.assign(out, this.publicSettings(out));
     if (auto && result.threadSettings) out.threadSettings = this.publicSettings(result.threadSettings);
     return out;
@@ -117,6 +132,9 @@ export class SmartBridge {
     const out = structuredClone(p);
     out.model = route.model;
     if (sessions.has(method)) {
+      // Start/fork have passed the provider check. Pin it alongside the route
+      // so a config change cannot redirect the checked OpenAI model mid-request.
+      out.modelProvider = 'openai';
       out.config = { ...out.config, model_reasoning_effort: route.effort };
       if ('effort' in out) out.effort = route.effort;
     }
@@ -192,7 +210,13 @@ export class SmartBridge {
       this.labels?.learnModels?.(result.data);
       if (params.cursor != null || !Array.isArray(result.data)) return result;
       let carrier;
-      try { carrier = await this.catalog(); }
+      try {
+        if (await this.configuredProvider(params) !== 'openai') {
+          this.audit({ event: 'model-list', smartListed: false, reason: 'unsupported-provider' });
+          return result;
+        }
+        carrier = await this.catalog();
+      }
       catch (error) { this.audit({ event: 'model-list', smartListed: false, reason: error.message }); return result; }
       this.audit({ event: 'model-list', smartListed: true });
       return { ...result, data: [{ ...carrier,
@@ -247,21 +271,104 @@ export class SmartBridge {
       return result;
     } finally { this.turnDispatches.delete(params.threadId); }
   }
+  async resumeRecoveryParams(params, error) {
+    // Only an explicit native configuration rejection is safe to recover here.
+    // Never retry lost responses, unrelated errors, or an explicitly requested
+    // provider: those do not establish that an obsolete saved provider caused it.
+    if (!error.nativeRejected || error.rpcError?.code !== -32600
+        || params.modelProvider != null || params.config?.model_provider != null) return null;
+    const missing = /^failed to load configuration: Model provider `([^`]+)` not found$/.exec(error.message)?.[1];
+    if (!missing) return null;
+    const cwd = params.cwd ?? (params.threadId
+      ? (await this.request('thread/read', { threadId: params.threadId, includeTurns: false })).thread?.cwd : undefined);
+    const config = await this.effectiveConfig({ ...params, cwd });
+    const provider = config.model_provider ?? 'openai';
+    const model = selectedModel(params) ?? config.model;
+    if (provider === missing || !model || model === AUTO) return null;
+    const effort = params.collaborationMode?.settings?.reasoning_effort ?? params.effort ?? config.model_reasoning_effort;
+    const out = { ...params, modelProvider: provider, model };
+    // Native config rejects null effort. Omit an unspecified value so native
+    // model defaults apply, rather than converting absence into invalid TOML.
+    if (effort != null) out.config = { ...params.config, model_reasoning_effort: effort };
+    return out;
+  }
+  async resume(params, previous) {
+    const explicit = selectedModel(params), id = params.threadId;
+    if (!previous && explicit !== AUTO) return this.request('thread/resume', params);
+    const sent = structuredClone(params);
+    if (explicit === AUTO) {
+      // Auto and its effort are UI placeholders. Let native resume restore the
+      // real settings; injecting the old route can apply a newly configured
+      // provider to an incompatible model, and is unnecessary just to open a chat.
+      if (sent.model === AUTO) delete sent.model;
+      delete sent.effort;
+      if (sent.config) {
+        if (sent.config.model === AUTO) delete sent.config.model;
+        delete sent.config.model_reasoning_effort;
+        if (!Object.keys(sent.config).length) delete sent.config;
+      }
+      if (sent.collaborationMode?.settings?.model === AUTO) {
+        delete sent.collaborationMode.settings.model;
+        delete sent.collaborationMode.settings.reasoning_effort;
+      }
+    }
+    // Resume does not send a turn. Buffer settings notifications until its
+    // authoritative provider is known, without persisting a new pending state.
+    if (id) this.pending.set(id, { mode: 'manual', phase: 'pending' });
+    else this.births++;
+    try {
+      this.audit({ event: 'dispatch', method: 'thread/resume', threadId: id ?? null, mode: previous?.mode ?? 'auto' });
+      let result, recoveredProvider = false;
+      try { result = await this.request('thread/resume', sent); }
+      catch (error) {
+        const recovery = await this.resumeRecoveryParams(sent, error);
+        if (!recovery) throw error;
+        this.audit({ event: 'resume-provider-recovery', threadId: id ?? null, provider: recovery.modelProvider, model: recovery.model });
+        result = await this.request('thread/resume', recovery);
+        recoveredProvider = true;
+      }
+      const savedId = result.thread?.id ?? id;
+      if (!savedId) throw new Error('Native response did not identify the resumed thread.');
+      // Legacy pending records may describe an interrupted send, not a failed
+      // resume. Opening is safe; only a concrete choice can clear that uncertainty.
+      // An echoed Auto value from the old composer is not such a choice.
+      // A changed provider must be reviewed in the picker before sending, even
+      // if the old selection was confirmed. Resume itself never runs inference.
+      const phase = recoveredProvider || (previous?.phase === 'pending' && (!explicit || explicit === AUTO)) ? 'pending' : 'confirmed';
+      const wantsAuto = explicit ? explicit === AUTO : previous?.mode === 'auto';
+      const mode = phase === 'confirmed' && wantsAuto && result.modelProvider === 'openai' ? 'auto' : 'manual';
+      this.store.write(savedId, { mode, phase, model: result.model, effort: result.reasoningEffort });
+      this.pending.delete(id);
+      this.audit({ event: 'accepted', method: 'thread/resume', threadId: savedId, mode, phase,
+        model: result.model, effort: result.reasoningEffort, provider: result.modelProvider });
+      return this.publicResult(result, savedId);
+    } finally {
+      this.pending.delete(id);
+      if (!id) this.births--;
+      this.flush();
+    }
+  }
   async mutate(method, params) {
     const id = params.threadId;
     const previous = id ? this.store.read(id) : null;
+    if (method === 'thread/resume') return this.resume(params, previous);
     const explicit = selectedModel(params);
-    if (previous?.phase === 'pending' && !explicit) throw new Error('Previous selection was interrupted. Select a concrete model before sending again.');
+    // A queued send can echo the stale Auto alias. Recovery requires a concrete
+    // model or a successful settings update, not merely that echoed value.
+    if (previous?.phase === 'pending' && (!explicit || (method === 'turn/start' && explicit === AUTO))) {
+      throw new Error('Previous selection was interrupted. Select a concrete model before sending again.');
+    }
     const mode = explicit ? (explicit === AUTO ? 'auto' : 'manual') : previous?.mode ?? 'manual';
     if (mode === 'manual' && !previous) return this.dispatch(method, params, mode);
     let nativeThread;
     if (mode === 'auto') {
       await this.catalog();
       if (id) nativeThread = (await this.request('thread/read', { threadId: id, includeTurns: false })).thread;
-      const provider = params.modelProvider ?? params.config?.model_provider ?? nativeThread?.modelProvider ?? 'openai';
+      const provider = sessions.has(method) ? await this.configuredProvider(params)
+        : params.modelProvider ?? params.config?.model_provider ?? nativeThread?.modelProvider ?? 'openai';
       if (provider !== 'openai') throw new Error('This prototype supports only the native OpenAI provider.');
     }
-    const birth = method === 'thread/start' || method === 'thread/fork' || (method === 'thread/resume' && !id);
+    const birth = method === 'thread/start' || method === 'thread/fork';
     let route = mode === 'auto' ? this.initialRoute(nativeThread, previous) : null;
     if (mode === 'auto' && method === 'turn/start') {
       const signal = this.classifications.get(id)?.signal ?? new AbortController().signal;
